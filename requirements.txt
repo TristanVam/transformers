@@ -2,3 +2,6 @@ numpy
 requests
 torch
 transformers
+tqdm
+tensorboard
+matplotlib

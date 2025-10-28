@@ -60,6 +60,8 @@ class PatchTSTConfig:
     num_layers: int = 4
     dropout: float = 0.1
     sentiment_dim: int = 768
+    num_symbols: int = 1
+    multi_horizon: int = 1
 
 
 class PatchTSTModel(nn.Module):
@@ -70,6 +72,8 @@ class PatchTSTModel(nn.Module):
         self.config = config
 
         self.embedding = PatchEmbedding(config.input_dim, config.patch_len, config.stride, config.d_model)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, config.d_model))
+        self.symbol_embedding = nn.Embedding(config.num_symbols, config.d_model)
         self.positional_encoding = PositionalEncoding(config.d_model, config.dropout)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=config.d_model,
@@ -86,13 +90,30 @@ class PatchTSTModel(nn.Module):
             num_heads=config.nhead,
             dropout=config.dropout,
         )
-        self.variational_head = VariationalHead(config.d_model)
+        self.regime_linear = nn.Linear(1, config.d_model)
+        self.variational_head = VariationalHead(config.d_model, horizons=config.multi_horizon)
 
-    def forward(self, features: torch.Tensor, sentiment: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        features: torch.Tensor,
+        sentiment: torch.Tensor,
+        symbol_ids: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
         # features: (batch, time, input_dim)
         tokens = self.embedding(features)
+        batch_size = tokens.size(0)
+        cls = self.cls_token.expand(batch_size, -1, -1)
+        symbol_embed = self.symbol_embedding(symbol_ids).unsqueeze(1)
+        cls = cls + symbol_embed
+        tokens = torch.cat([cls, tokens], dim=1)
         tokens = self.positional_encoding(tokens)
         encoded = self.encoder(tokens)
-        fused = self.sentiment_fusion(encoded, sentiment)
-        mu, log_sigma = self.variational_head(fused)
-        return {"mu": mu, "log_sigma": log_sigma}
+
+        fused_tokens, sentiment_cls = self.sentiment_fusion(encoded, sentiment)
+        cls_token = fused_tokens[:, 0, :]
+        regime_indicator = features[..., 0].std(dim=1, keepdim=True)
+        regime_gate = torch.sigmoid(self.regime_linear(regime_indicator))
+        cls_token = cls_token * regime_gate.squeeze(1) + sentiment_cls
+
+        mu, log_sigma = self.variational_head(cls_token)
+        return {"mu": mu, "log_sigma": log_sigma, "attention": self.sentiment_fusion.last_attention_weights}

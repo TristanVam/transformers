@@ -1,20 +1,12 @@
-# Hybrid Stochastic PatchTST for BTC/USDT ΔP Forecasting
+# Hybrid PatchTST Crypto Forecasting Pipeline
 
-Ce projet met en œuvre une architecture Transformer hybride capable de prévoir la
-variation de prix horaire (ΔP(t+1)) du pair BTC/USDT. Le pipeline combine plusieurs
-composants clés :
+Ce projet implémente une architecture Transformer robuste pour prévoir les variations de prix ΔP (ou log-return) multi-horizon sur des données crypto Binance. Le système combine :
 
-1. **Baseline PatchTST** – Embedding en patchs sur les séries OHLCV pour exploiter
-   les dépendances temporelles à long terme.
-2. **Brownian Data Augmentation** – Génération de trajectoires de type mouvement
-   brownien géométrique pour exposer le modèle à des scénarios de volatilité variés.
-3. **Variational Head** – Prédiction conjointe de la moyenne et de la volatilité
-   (μ, σ) au lieu d’une valeur unique, permettant une meilleure calibration du risque.
-4. **Fusion de Sentiment** – Cross-attention entre les représentations temporelles et
-   des embeddings FinBERT extraits de tweets/flux d’actualité.
-
-L’architecture est reliée à l’API publique de Binance afin de télécharger automatiquement
-les chandeliers horaires BTC/USDT et de lancer l’entraînement.
+- **PatchTST amélioré** avec token `[CLS]` appris, embedding de symbole et régulation de régime (volatilité/ATR simplifié) pour stabiliser la tête variationnelle.
+- **Tête variationnelle (μ, σ)** avec clamp et régularisation L2 sur `log_sigma` pour produire des intervalles calibrés.
+- **Fusion de sentiment FinBERT** via cross-attention avec gating sigmoïde, dropout et pooling par token `[CLS]`.
+- **Augmentation brownienne corrélée** (drift/sigma estimés sur la dernière portion de la fenêtre, bruit corrélé prix/volume) appliquée uniquement aux splits d’entraînement.
+- **Validation walk-forward** et ensembling SGDR pour simuler un déploiement réel et lisser les prédictions.
 
 ## Installation
 
@@ -24,53 +16,75 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-> **Remarque :** PyTorch et `transformers` (Hugging Face) sont requis. Adaptez
-> l’installation de PyTorch (CPU/GPU) selon votre environnement.
+PyTorch doit être installé avec l’extension GPU appropriée si nécessaire. TensorBoard est utilisé pour les logs.
 
-## Entraînement
+## Configuration
+
+Tous les hyperparamètres sont centralisés dans `src/training/config.py` et peuvent être surchargés via un JSON (exemple : `configs/experiment_example.json`). Les champs couvrent :
+
+- Paramètres data (multi-symboles, taille de fenêtre, horizons multiples, demi-vie du sentiment)
+- Augmentation brownienne (ρ, nombre de trajectoires, limite par fenêtre)
+- Optimiseur (lr, weight decay, betas, eps)
+- Entraînement (batch size, scheduler cosine + warmup, mixed precision, clipping, seed, patience early stopping, workers, répertoires de sortie/logs)
+
+## Lancement d’un entraînement
 
 ```bash
-python scripts/train.py --log-level INFO
+python scripts/train.py --config configs/experiment_example.json --log-level INFO
 ```
 
-Vous pouvez fournir un fichier JSON pour personnaliser les hyperparamètres
-(`--config path/to/config.json`). Les paramètres disponibles sont décrits dans
-`src/training/config.py`.
+Le pipeline :
 
-Le script téléchargera automatiquement les données, entraînera le modèle et
-sauvegardera le checkpoint dans `checkpoints/patchtst_hybrid.pt`.
+1. Télécharge les chandeliers horaires depuis Binance (avec cache `.npy`, retry/backoff, validation UTC).
+2. Prépare un encodeur FinBERT et une fonction de lookup de sentiment (à adapter pour votre source de tweets).
+3. Construit les jeux de données avec split temporel strict, moyenne exponentielle du sentiment et augmentation brownienne contrôlée.
+4. Entraîne le modèle avec :
+   - **Mixed precision** (`torch.cuda.amp`) + `GradScaler`
+   - **Clipping** des gradients (`max_norm = 1.0`)
+   - **Scheduler CosineAnnealingLR avec warmup**
+   - **Early stopping** sur la perte de validation et sauvegarde du meilleur checkpoint
+   - **Logging TensorBoard** (loss, métriques, attention, PnL, Sharpe, coverage, etc.)
+   - **Sauvegarde d’état complet** (modèle, optimiseur, scheduler, scaler, epoch)
+5. Calcule une validation **walk-forward** multi-fold, agrège les métriques (MAE, RMSE, NLL, coverage, hit ratio, PnL simulé, Sharpe) et moyenne les snapshots récents pour un ensembling SGDR.
+6. Sauvegarde les cartes d’attention (`checkpoints/attention/attention_epoch_*.pt`) et le checkpoint final.
 
-## Structure du projet
+Les logs TensorBoard peuvent être visualisés via :
+
+```bash
+tensorboard --logdir runs
+```
+
+## Visualisation & Explicabilité
+
+- **Cartes d’attention** : le pipeline enregistre les poids de cross-attention sentiment/temps. Utilisez `python -m src.utils.attention_viz path/to/attention_epoch_X.pt --head 0 --output attention.png` pour générer une heatmap.
+- **Analyse des têtes** : les histogrammes TensorBoard exposent la distribution des poids par tête, permettant de contrôler l’entropie et les heads dominantes.
+
+## Structure du dépôt
 
 ```
 src/
 ├── data/
-│   ├── augmentation.py      # Brownian data augmentation
-│   ├── binance.py           # Client REST Binance pour les chandeliers
-│   └── dataset.py           # Dataset PatchTST avec sentiment et augmentation
+│   ├── augmentation.py      # Augmentation brownienne corrélée et contrôlée
+│   ├── binance.py           # Client REST Binance avec cache et retry
+│   └── dataset.py           # Dataset multi-symboles, sentiment pondéré, multi-horizon
 ├── models/
-│   ├── patchtst.py          # Backbone PatchTST + fusion sentiment
-│   ├── sentiment.py         # Cross-attention avec embeddings FinBERT
-│   └── variational.py       # Tête variationnelle (μ, σ)
+│   ├── patchtst.py          # PatchTST + fusion sentiment + gating de régime
+│   ├── sentiment.py         # Cross-attention FinBERT avec gating sigmoïde
+│   └── variational.py       # Tête variationnelle (μ, σ) multi-horizon
 ├── training/
-│   ├── config.py            # Dataclasses de configuration
-│   └── pipeline.py          # Pipeline d’entraînement complet
+│   ├── config.py            # Dataclasses & sérialisation JSON
+│   └── pipeline.py          # Pipeline complet (AMP, scheduler, early stopping, walk-forward)
 └── utils/
-    └── sentiment.py         # Encodage FinBERT des tweets
+    ├── attention_viz.py     # Script de visualisation d’attention
+    └── sentiment.py         # Encodage FinBERT et helpers
 
 scripts/
-└── train.py                 # Point d’entrée CLI
+└── train.py                 # Entrée CLI
 ```
 
-## Tweets & FinBERT
+## Prochaines étapes
 
-Le module `src/utils/sentiment.py` encapsule FinBERT pour transformer des textes
-financiers courts (tweets) en embeddings. Dans le pipeline fourni, un texte de
-placeholder est utilisé ; il suffit de remplacer cette logique par une récupération
-réelle des tweets via l’API de votre choix afin de bénéficier pleinement de la
-fusion de sentiment.
+- Connecter la fonction de sentiment à une source temps réel (Twitter, actualités) et enrichir les features (FinBERT + volume social).
+- Brancher la sortie du modèle à une plateforme de trading via API en exploitant les intervalles de confiance pour dimensionner les positions.
 
-## Licence
-
-Projet fourni à titre éducatif. Utilisation sous votre propre responsabilité pour
-le trading algorithmique.
+> **Disclaimer** : Ce code est fourni à des fins de recherche et d’expérimentation. Le trading algorithmique comporte des risques significatifs.

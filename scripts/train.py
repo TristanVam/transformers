@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 from pathlib import Path
 
@@ -29,8 +28,7 @@ def parse_args() -> argparse.Namespace:
 def load_config(path: Path | None) -> ExperimentConfig:
     if path is None:
         return ExperimentConfig()
-    data = json.loads(path.read_text())
-    return ExperimentConfig(**data)
+    return ExperimentConfig.from_json(path)
 
 
 def main() -> None:
