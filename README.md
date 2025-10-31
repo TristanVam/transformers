@@ -54,6 +54,15 @@ Les logs TensorBoard peuvent être visualisés via :
 tensorboard --logdir runs
 ```
 
+## Combien de données télécharger ?
+
+- **Fenêtre modèle** : chaque échantillon d’entraînement consomme 64 chandelles horaires (≈2,5 jours) plus l’horizon cible.
+- **Objectif recommandé** : pour obtenir ≈3 000 fenêtres d’entraînement par symbole (ce qui stabilise les métriques et le scheduler), visez **au moins 4 300 chandelles** dans le split temporel total — soit ~180 jours d’historique 1h. Après le split 70 %/30 %, cela laisse ~3 000 chandelles pour le train et ≈2 960 fenêtres effectives.
+- **Minimum praticable** : si vous ne pouvez récupérer que ~1 500 chandelles (≈62 jours), vous obtiendrez ~1 400 fenêtres ; en dessous de ce seuil, la variance des performances augmente sensiblement.
+- **Multi-symboles** : multipliez ces quantités par le nombre de paires suivies. Chaque symbole dispose de son propre cache `.npy/.parquet`, et l’augmentation brownienne ne s’applique qu’au split entraînement.
+
+Ces estimations supposent des horizons courts (1 h, 4 h, 12 h). Pour des horizons plus longs, augmentez proportionnellement la profondeur historique pour conserver le même nombre de fenêtres exploitables.
+
 ## Visualisation & Explicabilité
 
 - **Cartes d’attention** : le pipeline enregistre les poids de cross-attention sentiment/temps. Utilisez `python -m src.utils.attention_viz path/to/attention_epoch_X.pt --head 0 --output attention.png` pour générer une heatmap.
